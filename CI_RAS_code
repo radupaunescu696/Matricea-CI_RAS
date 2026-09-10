@@ -34,18 +34,27 @@
 ##     zero — this only touches rows/columns that are IMPOSSIBLE otherwise.
 ## ═══════════════════════════════════════════════════════════════════════════
 
-## ─────────────────────────────────────────────────────────────────────────
-## 0. PACKAGES
-## ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 0.  PACKAGES
+# ─────────────────────────────────────────────────────────────────────────────
 required_packages <- c(
+  # Documents
   "officer", "flextable", "xml2", "htmltools", "quarto", "reticulate",
+  # Data import/export
   "readxl", "openxlsx", "writexl", "foreign",
+  # Data wrangling
   "dplyr", "tidyverse", "purrr", "janitor", "magrittr",
+  # Spatial
   "sf", "nuts", "giscoR", "eurostat",
-  "ggplot2", "ggthemes", "ggfortify", "gridExtra", "patchwork", "factoextra", "corrplot",
+  # Plots
+  "ggplot2", "ggthemes", "ggfortify", "gridExtra", "patchwork", "factoextra",
+  "corrplot",
+  # Tables
   "DT", "knitr", "kableExtra", "formattable", "modelsummary", "stargazer",
+  # Econometrics
   "plm", "quantreg", "robustbase", "lmtest", "sandwich", "car", "tseries",
   "nortest", "moments", "strucchange", "skedastic",
+  # Misc
   "broom", "ExcelFunctionsR"
 )
 
@@ -58,22 +67,22 @@ success <- sapply(required_packages, function(pkg) {
   tryCatch({ library(pkg, character.only = TRUE); TRUE },
            error = function(e) FALSE)
 })
-failed <- names(success)[!success]
-if (length(failed) > 0) {
-  warning("The following packages could NOT be loaded: ",
-          paste(failed, collapse = ", "),
-          ". If any of readxl / openxlsx / writexl are in this list, ",
-          "the script will fail below — install them and re-run.")
-} else {
-  cat("\n\u2714 All", length(required_packages), "packages loaded successfully.\n\n")
+
+# Fail fast and clearly if a package couldn't be loaded, instead of hitting
+# a cryptic "could not find function" error somewhere downstream.
+if (any(!success)) {
+  stop("Failed to load package(s): ",
+       paste(names(success)[!success], collapse = ", "),
+       ". Install them manually and re-run.")
 }
 
+#invisible(lapply(required_packages, library, character.only = TRUE))
 ## ─────────────────────────────────────────────────────────────────────────
 ## 1. CONFIG
 ## ─────────────────────────────────────────────────────────────────────────
 an           <- 2022
-input_file   <- "D:/Proiecte Rproj/Matrice CI/test.xlsx"            # source workbook (seed matrix + targets)
-sheet_name   <- "test"                                              # sheet name in input_file
+input_file   <- "D:/Proiecte Rproj/Matrice CI/sursa.xlsx"            # source workbook (seed matrix + targets)
+sheet_name   <- "sursa"                                              # sheet name in input_file
 output_file  <- "D:/Proiecte Rproj/Matrice CI/Matricea CI_RAS.xlsx" # standalone result workbook (created fresh)
 
 input_file2  <- "D:/Proiecte Rproj/Matrice CI/Denumiri.xlsx"       # existing naming/reporting template — READ ONLY, never modified
@@ -115,7 +124,6 @@ col_target <- read_excel(input_file, sheet = sheet_name,
 col_target <- as.numeric(col_target[1, ])
 col_target[is.na(col_target)] <- 0
 
-# Fail loudly and immediately if the targets don't line up with the
 # matrix shape, rather than getting a cryptic recycling error mid-loop.
 stopifnot(
   "row_target length must equal nrow(seed)"    = length(row_target) == n_rows,
@@ -173,13 +181,15 @@ if (length(bad_cols) > 0) {
 #' @param col_target  numeric vector, length n_cols: desired column sums
 #' @param max_iter    maximum number of row+column passes before giving up
 #' @param tol         stop once BOTH max row error and max column error are below this
-#' @return list(matrix = balanced matrix, history = per-iteration error log)
+#' @return list(matrix = balanced matrix, history = per-iteration error log,
+#'              iterations_run = number of iterations actually executed,
+#'              converged = TRUE/FALSE whether tol was reached)
 ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6) {
   X <- seed
   
-# Ratio helper that treats 0/0 as "leave it at 0" instead of NaN: a row
-# or column whose current AND target totals are both zero should just
-# stay zero, not blow up into an undefined multiplier.
+  # Ratio helper that treats 0/0 as "leave it at 0" instead of NaN: a row
+  # or column whose current AND target totals are both zero should just
+  # stay zero, not blow up into an undefined multiplier.
   safe_ratio <- function(target, actual) {
     r <- numeric(length(target))
     nz <- actual != 0
@@ -187,10 +197,11 @@ ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6
     r[!nz] <- 0
     r
   }
- 
+  
   history <- data.frame(iteration = integer(0),
                         max_row_err = numeric(0),
                         max_col_err = numeric(0))
+  converged <- FALSE
   for (k in seq_len(max_iter)) {
     # --- row scaling: multiply every row by (its target / its current sum) ---
     rfac <- safe_ratio(row_target, rowSums(X))
@@ -214,20 +225,23 @@ ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6
     }
     
     if (row_err < tol && col_err < tol) {
+      converged <- TRUE
       cat(sprintf("Converged after %d iterations (row err %.2e, col err %.2e)\n",
                   k, row_err, col_err))
       break
     }
   }
   
-  if (row_err >= tol || col_err >= tol) {
+  if (!converged) {
     warning(sprintf(
       "Did not reach tolerance %.1e within %d iterations (row err %.2e, col err %.2e). ",
       tol, max_iter, row_err, col_err),
       "Consider raising max_iter, or re-checking target feasibility.")
   }
   
-  list(matrix = X, history = history)
+  list(matrix = X, history = history,
+       iterations_run = nrow(history),
+       converged = converged)
 }
 
 ## ─────────────────────────────────────────────────────────────────────────
@@ -235,6 +249,16 @@ ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6
 ## ─────────────────────────────────────────────────────────────────────────
 result   <- ras_balance(seed, row_target, col_target, max_iter = max_iter, tol = tol)
 balanced <- result$matrix
+
+# Summary Metadata Data Frame
+summary_metadata <- data.frame(
+  Metric = c("Year", "Total Iterations Executed", "Convergence Achieved", "Final Max Row Error", "Final Max Column Error"),
+  Value  = c(as.character(an), 
+             as.character(result$iterations_run), 
+             as.character(result$converged), 
+             sprintf("%.2e", tail(result$history$max_row_err, 1)), 
+             sprintf("%.2e", tail(result$history$max_col_err, 1)))
+)
 
 ## ─────────────────────────────────────────────────────────────────────────
 ## 7. REPORT
@@ -305,10 +329,13 @@ writeData(
   colNames = FALSE,
   rowNames = FALSE
 )
+# Add Metadata sheet to report iterations count
+addWorksheet(wb_den, "Metadata_RAS")
+writeData(wb_den, sheet = "Metadata_RAS", x = summary_metadata)
 
 # 6. Save out to output_file2 (input_file2 remains untouched)
 saveWorkbook(wb_den, output_file2, overwrite = TRUE)
 
 cat(sprintf("\nBalanced matrix written into a new copy of the template: '%s' (sheet '%s').\n",
             output_file2, sheet_name_output))
-cat(sprintf("Original template left untouched: '%s'\n", input_file2))
+message("Gata!")
