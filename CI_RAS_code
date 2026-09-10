@@ -1,0 +1,314 @@
+## ═══════════════════════════════════════════════════════════════════════════
+## RAS (iterative proportional fitting) balancing script
+## ═══════════════════════════════════════════════════════════════════════════
+## WHAT THIS DOES
+##   Takes a seed matrix (B6:CK93 in `input_file`) and rebalances it so that
+##   BOTH its row totals and its column totals match given targets:
+##     - row targets    -> column CM,  rows 6-93   (one target per row)
+##     - column targets -> row 95,     columns B-CK (one target per column)
+##   The method is RAS / iterative proportional fitting (IPF):
+##     repeat { scale every row to its target; scale every column to its
+##              target } until both margins match to within `tol`.
+##   Because the two scaling passes alternate, a single pass on its own
+##   would only satisfy whichever margin was scaled last — that's why this
+##   loops, instead of doing one row-scale and one column-scale and stopping.
+##
+## OUTPUTS
+##   1. `Denumiri.xlsx` (the naming/reporting template) gets the balanced
+##      matrix written into its target sheet, with the template's own row
+##      and column labels attached. The output sheet is renamed dynamically
+##      to include the year variable (e.g., "Matricea_CI_RAS_2022").
+##   2. `output_file` gets a fresh workbook with the balanced matrix
+##      (plain B..CK-style headers) and a sheet logging the error at every
+##      iteration, so you can see convergence rather than take it on faith.
+##
+## THINGS TO WATCH
+##   - RAS can only match BOTH margins exactly if their totals are equal
+##     (sum of row targets == sum of column targets). The script checks
+##     this and warns if it isn't (see "FEASIBILITY CHECK").
+##   - A row or column that is entirely zero in the seed data but has a
+##     NON-zero target can never be fixed by scaling alone (0 * anything
+##     is still 0). The script detects this and seeds those rows/columns
+##     with a negligible `epsilon` so RAS has something to redistribute
+##     (see "FIX STRUCTURAL ZEROS"). Every other zero is left as a real
+##     zero — this only touches rows/columns that are IMPOSSIBLE otherwise.
+## ═══════════════════════════════════════════════════════════════════════════
+
+## ─────────────────────────────────────────────────────────────────────────
+## 0. PACKAGES
+## ─────────────────────────────────────────────────────────────────────────
+required_packages <- c(
+  "officer", "flextable", "xml2", "htmltools", "quarto", "reticulate",
+  "readxl", "openxlsx", "writexl", "foreign",
+  "dplyr", "tidyverse", "purrr", "janitor", "magrittr",
+  "sf", "nuts", "giscoR", "eurostat",
+  "ggplot2", "ggthemes", "ggfortify", "gridExtra", "patchwork", "factoextra", "corrplot",
+  "DT", "knitr", "kableExtra", "formattable", "modelsummary", "stargazer",
+  "plm", "quantreg", "robustbase", "lmtest", "sandwich", "car", "tseries",
+  "nortest", "moments", "strucchange", "skedastic",
+  "broom", "ExcelFunctionsR"
+)
+
+new_pkgs <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(new_pkgs) > 0) {
+  message("Installing missing packages: ", paste(new_pkgs, collapse = ", "))
+  install.packages(new_pkgs, dependencies = TRUE)
+}
+success <- sapply(required_packages, function(pkg) {
+  tryCatch({ library(pkg, character.only = TRUE); TRUE },
+           error = function(e) FALSE)
+})
+failed <- names(success)[!success]
+if (length(failed) > 0) {
+  warning("The following packages could NOT be loaded: ",
+          paste(failed, collapse = ", "),
+          ". If any of readxl / openxlsx / writexl are in this list, ",
+          "the script will fail below — install them and re-run.")
+} else {
+  cat("\n\u2714 All", length(required_packages), "packages loaded successfully.\n\n")
+}
+
+## ─────────────────────────────────────────────────────────────────────────
+## 1. CONFIG
+## ─────────────────────────────────────────────────────────────────────────
+an           <- 2022
+input_file   <- "D:/Proiecte Rproj/Matrice CI/test.xlsx"            # source workbook (seed matrix + targets)
+sheet_name   <- "test"                                              # sheet name in input_file
+output_file  <- "D:/Proiecte Rproj/Matrice CI/Matricea CI_RAS.xlsx" # standalone result workbook (created fresh)
+
+input_file2  <- "D:/Proiecte Rproj/Matrice CI/Denumiri.xlsx"       # existing naming/reporting template — READ ONLY, never modified
+output_file2 <- "D:/Proiecte Rproj/Matrice CI/Matricea CI_RAS.xlsx"   # new workbook: a full copy of the template with balanced results written in
+sheet_name2  <- "nom"                                               # sheet in the input template to read from
+
+# Combines the base label, an underscore, and the 'an' object (e.g., "Matricea_CI_RAS_2022")
+sheet_name_output <- paste0("Matricea_CI_RAS_", an)
+
+max_iter <- 500      # hard cap on RAS iterations, in case of non-convergence
+tol      <- 1e-6     # convergence tolerance: max allowed |actual total - target| on either margin
+epsilon  <- 1e-6     # placeholder value used ONLY for rows/cols that are all-zero but have a nonzero target
+
+## ─────────────────────────────────────────────────────────────────────────
+## 2. READ THE SEED MATRIX AND TARGETS
+## ─────────────────────────────────────────────────────────────────────────
+# col_names = FALSE is essential here: with the default (TRUE), readxl
+# would treat the FIRST row of B6:CK93 (i.e. row 6 of the sheet) as a
+# header and silently drop it from the data — you'd end up balancing an
+# 87-row matrix without realizing a row went missing.
+seed <- read_excel(input_file, sheet = sheet_name,
+                   range = "B6:CK93", col_names = FALSE)
+seed <- as.matrix(seed)
+storage.mode(seed) <- "double"
+seed[is.na(seed)] <- 0
+
+n_rows <- nrow(seed)   # 88
+n_cols <- ncol(seed)   # 88
+
+# Row targets: column CM, rows 6-93 (one value per matrix row)
+row_target <- read_excel(input_file, sheet = sheet_name,
+                         range = "CM6:CM93", col_names = FALSE)
+row_target <- as.numeric(row_target[[1]])
+row_target[is.na(row_target)] <- 0
+
+# Column targets: row 95, columns B-CK (one value per matrix column)
+col_target <- read_excel(input_file, sheet = sheet_name,
+                         range = "B95:CK95", col_names = FALSE)
+col_target <- as.numeric(col_target[1, ])
+col_target[is.na(col_target)] <- 0
+
+# Fail loudly and immediately if the targets don't line up with the
+# matrix shape, rather than getting a cryptic recycling error mid-loop.
+stopifnot(
+  "row_target length must equal nrow(seed)"    = length(row_target) == n_rows,
+  "col_target length must equal ncol(seed)"    = length(col_target) == n_cols
+)
+
+## ─────────────────────────────────────────────────────────────────────────
+## 3. FEASIBILITY CHECK
+## ─────────────────────────────────────────────────────────────────────────
+# RAS preserves the grand total of the matrix at every step (scaling rows
+# then columns never changes the overall sum in a way that lets both
+# margins be hit exactly unless their totals agree). If they don't agree,
+# RAS still converges, but to the closest achievable compromise — one or
+# both margins will be off by roughly `total_diff` spread across cells.
+total_diff <- sum(row_target) - sum(col_target)
+cat(sprintf("Sum of row targets:    %.4f\n", sum(row_target)))
+cat(sprintf("Sum of column targets: %.4f\n", sum(col_target)))
+cat(sprintf("Difference:            %.6f\n", total_diff))
+if (abs(total_diff) > 1e-6) {
+  warning("Row and column target totals do not match exactly (difference = ",
+          round(total_diff, 6), ") \u2014 RAS will converge to the best ",
+          "compromise, not to both margins exactly.")
+}
+
+## ─────────────────────────────────────────────────────────────────────────
+## 4. FIX STRUCTURAL ZEROS
+## ─────────────────────────────────────────────────────────────────────────
+# A row/column that is all-zero in the seed but has a nonzero target is
+# mathematically unreachable by RAS (you can't scale your way up from
+# zero). This block finds any such rows/columns, reports them explicitly
+# (so you can sanity-check whether that's expected, e.g. a category with
+# genuinely no historical activity but a projected target), and gives
+# them a negligible epsilon value so the iteration can actually move
+# them toward their target instead of looping forever at zero.
+bad_rows <- which(rowSums(seed) == 0 & row_target != 0)
+bad_cols <- which(colSums(seed) == 0 & col_target != 0)
+
+if (length(bad_rows) > 0) {
+  cat("NOTE: seed rows with zero data but a nonzero target (fixed with epsilon):\n")
+  print(data.frame(row_index = bad_rows, target = row_target[bad_rows]))
+  seed[bad_rows, ] <- epsilon
+}
+if (length(bad_cols) > 0) {
+  cat("NOTE: seed columns with zero data but a nonzero target (fixed with epsilon):\n")
+  print(data.frame(col_index = bad_cols, target = col_target[bad_cols]))
+  seed[, bad_cols] <- epsilon
+}
+
+## ─────────────────────────────────────────────────────────────────────────
+## 5. RAS / IPF ITERATION FUNCTION
+## ─────────────────────────────────────────────────────────────────────────
+#' Balance a matrix to match given row and column totals (RAS / IPF).
+#' @param seed        starting matrix (n_rows x n_cols)
+#' @param row_target  numeric vector, length n_rows: desired row sums
+#' @param col_target  numeric vector, length n_cols: desired column sums
+#' @param max_iter    maximum number of row+column passes before giving up
+#' @param tol         stop once BOTH max row error and max column error are below this
+#' @return list(matrix = balanced matrix, history = per-iteration error log)
+ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6) {
+  X <- seed
+  
+# Ratio helper that treats 0/0 as "leave it at 0" instead of NaN: a row
+# or column whose current AND target totals are both zero should just
+# stay zero, not blow up into an undefined multiplier.
+  safe_ratio <- function(target, actual) {
+    r <- numeric(length(target))
+    nz <- actual != 0
+    r[nz]  <- target[nz] / actual[nz]
+    r[!nz] <- 0
+    r
+  }
+ 
+  history <- data.frame(iteration = integer(0),
+                        max_row_err = numeric(0),
+                        max_col_err = numeric(0))
+  for (k in seq_len(max_iter)) {
+    # --- row scaling: multiply every row by (its target / its current sum) ---
+    rfac <- safe_ratio(row_target, rowSums(X))
+    X <- X * rfac                      # recycles rfac down each row
+    
+    # --- column scaling: multiply every column by (its target / its current sum) ---
+    cfac <- safe_ratio(col_target, colSums(X))
+    X <- sweep(X, 2, cfac, `*`)
+    
+    # --- convergence check, after a full row+column pass ---
+    row_err <- max(abs(rowSums(X) - row_target))
+    col_err <- max(abs(colSums(X) - col_target))
+    history <- rbind(history, data.frame(iteration = k,
+                                         max_row_err = row_err,
+                                         max_col_err = col_err))
+    
+    # Print progress periodically so a long run isn't silent.
+    if (k %% 20 == 0) {
+      cat(sprintf("  iter %4d: max row err = %.4e, max col err = %.4e\n",
+                  k, row_err, col_err))
+    }
+    
+    if (row_err < tol && col_err < tol) {
+      cat(sprintf("Converged after %d iterations (row err %.2e, col err %.2e)\n",
+                  k, row_err, col_err))
+      break
+    }
+  }
+  
+  if (row_err >= tol || col_err >= tol) {
+    warning(sprintf(
+      "Did not reach tolerance %.1e within %d iterations (row err %.2e, col err %.2e). ",
+      tol, max_iter, row_err, col_err),
+      "Consider raising max_iter, or re-checking target feasibility.")
+  }
+  
+  list(matrix = X, history = history)
+}
+
+## ─────────────────────────────────────────────────────────────────────────
+## 6. RUN RAS
+## ─────────────────────────────────────────────────────────────────────────
+result   <- ras_balance(seed, row_target, col_target, max_iter = max_iter, tol = tol)
+balanced <- result$matrix
+
+## ─────────────────────────────────────────────────────────────────────────
+## 7. REPORT
+## ─────────────────────────────────────────────────────────────────────────
+cat("\n--- Final check ---\n")
+cat(sprintf("Max |row total - target|:    %.8f\n", max(abs(rowSums(balanced) - row_target))))
+cat(sprintf("Max |column total - target|: %.8f\n", max(abs(colSums(balanced) - col_target))))
+cat(sprintf("Iterations run: %d\n", nrow(result$history)))
+cat(sprintf("Grand total (balanced vs. target): %.4f vs. %.4f\n",
+            sum(balanced), sum(row_target)))
+
+## ─────────────────────────────────────────────────────────────────────────
+## 8. WRITE BALANCED MATRIX INTO A COPY OF THE Denumiri.xlsx TEMPLATE
+## ─────────────────────────────────────────────────────────────────────────
+if (!file.exists(input_file2)) {
+  stop("Template file not found: ", input_file2,
+       ". Skipping step 8 \u2014 fix the path and re-run, or comment this section out.")
+}
+
+# 1. Load the template into memory
+wb_den <- loadWorkbook(input_file2)
+
+# 2. Extract row and column labels from the original sheet ("nom")
+nom_template <- readWorkbook(wb_den, sheet = sheet_name2, colNames = FALSE)
+row_codes    <- as.character(nom_template[2:nrow(nom_template), 1])
+col_codes    <- as.character(nom_template[1, 2:ncol(nom_template)])
+
+# 3. Rename the sheet in memory from "nom" to the dynamic sheet name (e.g., "Matricea_CI_RAS_2022")
+renameWorksheet(wb_den, sheet = sheet_name2, newName = sheet_name_output)
+
+# 4. Decide whether template expects total rows/columns and format output dataframe
+expects_totals <- length(row_codes) == n_rows + 1
+
+if (expects_totals) {
+  if (length(col_codes) != n_cols + 1) {
+    stop("Template mismatch: row_codes implies a TOTAL row/column (",
+         length(row_codes), " row labels for ", n_rows, " matrix rows), ",
+         "but col_codes has ", length(col_codes), " labels instead of the ",
+         "expected ", n_cols + 1, ". Check the header row for a missing or blank TOTAL label.")
+  }
+  
+  balanced_df           <- as.data.frame(balanced)
+  balanced_df$TOTAL     <- rowSums(balanced)
+  col_totals            <- c(colSums(balanced), sum(balanced))
+  balanced_df           <- rbind(balanced_df, col_totals)
+  rownames(balanced_df) <- row_codes
+  colnames(balanced_df) <- col_codes
+  
+} else {
+  if (length(row_codes) < n_rows || length(col_codes) < n_cols) {
+    stop("Template mismatch: template provides ", length(row_codes),
+         " row labels and ", length(col_codes), " column labels, but the ",
+         "balanced matrix has ", n_rows, " rows and ", n_cols, " columns.")
+  }
+  
+  balanced_df           <- as.data.frame(balanced)
+  rownames(balanced_df) <- row_codes[seq_len(n_rows)]
+  colnames(balanced_df) <- col_codes[seq_len(n_cols)]
+}
+
+# 5. Write data into the dynamically renamed sheet
+writeData(
+  wb       = wb_den,
+  sheet    = sheet_name_output,
+  x        = balanced_df,
+  startRow = 2,
+  startCol = 2,
+  colNames = FALSE,
+  rowNames = FALSE
+)
+
+# 6. Save out to output_file2 (input_file2 remains untouched)
+saveWorkbook(wb_den, output_file2, overwrite = TRUE)
+
+cat(sprintf("\nBalanced matrix written into a new copy of the template: '%s' (sheet '%s').\n",
+            output_file2, sheet_name_output))
+cat(sprintf("Original template left untouched: '%s'\n", input_file2))
