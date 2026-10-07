@@ -9,29 +9,29 @@
 ##   The method is RAS / iterative proportional fitting (IPF):
 ##     repeat { scale every row to its target; scale every column to its
 ##              target } until both margins match to within `tol`.
-##   Because the two scaling passes alternate, a single pass on its own
-##   would only satisfy whichever margin was scaled last — that's why this
-##   loops, instead of doing one row-scale and one column-scale and stopping.
 ##
 ## OUTPUTS
-##   1. `Denumiri.xlsx` (the naming/reporting template) gets the balanced
-##      matrix written into its target sheet, with the template's own row
-##      and column labels attached. The output sheet is renamed dynamically
-##      to include the year variable (e.g., "Matricea_CI_RAS_2022").
-##   2. `output_file` gets a fresh workbook with the balanced matrix
-##      (plain B..CK-style headers) and a sheet logging the error at every
-##      iteration, so you can see convergence rather than take it on faith.
+##   1. `output_file2`: a copy of the `Denumiri.xlsx` template with the
+##      balanced matrix written into its target sheet (renamed to include
+##      the year, e.g. "Matricea_CI_RAS_2022") plus a "Metadata_RAS" sheet.
+##   2. `output_file`: a fresh workbook with the balanced matrix and a sheet
+##      logging the error at every iteration.
 ##
-## THINGS TO WATCH
-##   - RAS can only match BOTH margins exactly if their totals are equal
-##     (sum of row targets == sum of column targets). The script checks
-##     this and warns if it isn't (see "FEASIBILITY CHECK").
-##   - A row or column that is entirely zero in the seed data but has a
-##     NON-zero target can never be fixed by scaling alone (0 * anything
-##     is still 0). The script detects this and seeds those rows/columns
-##     with a negligible `epsilon` so RAS has something to redistribute
-##     (see "FIX STRUCTURAL ZEROS"). Every other zero is left as a real
-##     zero — this only touches rows/columns that are IMPOSSIBLE otherwise.
+## WHAT CHANGED vs. THE PREVIOUS VERSION (why targets were not reached)
+##   RAS can only rescale cells that are already non-zero. If a row's target
+##   is larger than the sum of the column targets of the columns where that
+##   row has non-zero seed values, that row can NEVER reach its target, no
+##   matter how many iterations you run.
+##   - NEW section 3b: SUPPORT CHECK detects such rows/columns.
+##   - NEW section 4b: optional automatic fix (`auto_fix_support`) that puts
+##     small seed values into the zero cells of those rows/columns so RAS has
+##     something to redistribute. Every cell touched is reported.
+##   - NEW `reconcile_totals`: rescales the column targets so their total
+##     equals the row-target total (removes a tiny 0.0129 mismatch that would
+##     otherwise prevent "convergence" at tol = 1e-6).
+##   - `output_file` and `output_file2` were the same path (the second write
+##     overwrote the first); they are now different files, and the
+##     standalone workbook with the iteration log is actually written.
 ## ═══════════════════════════════════════════════════════════════════════════
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ required_packages <- c(
   # Data wrangling
   "dplyr", "tidyverse", "purrr", "janitor", "magrittr",
   # Spatial
-  "sf", "nuts", "giscoR", "eurostat",
+  "sf", "nuts", "giscoR", #"eurostat",
   # Plots
   "ggplot2", "ggthemes", "ggfortify", "gridExtra", "patchwork", "factoextra",
   "corrplot",
@@ -68,41 +68,47 @@ success <- sapply(required_packages, function(pkg) {
            error = function(e) FALSE)
 })
 
-# Fail fast and clearly if a package couldn't be loaded, instead of hitting
-# a cryptic "could not find function" error somewhere downstream.
 if (any(!success)) {
   stop("Failed to load package(s): ",
        paste(names(success)[!success], collapse = ", "),
        ". Install them manually and re-run.")
 }
 
-#invisible(lapply(required_packages, library, character.only = TRUE))
 ## ─────────────────────────────────────────────────────────────────────────
 ## 1. CONFIG
 ## ─────────────────────────────────────────────────────────────────────────
-an           <- 2022
+an           <- 2024
 input_file   <- "D:/Proiecte Rproj/Matrice CI/sursa.xlsx"            # source workbook (seed matrix + targets)
 sheet_name   <- "sursa"                                              # sheet name in input_file
-output_file  <- "D:/Proiecte Rproj/Matrice CI/Matricea CI_RAS.xlsx" # standalone result workbook (created fresh)
+output_file  <- "D:/Proiecte Rproj/Matrice CI/Matricea CI_RAS_log.xlsx" # standalone result workbook (balanced matrix + iteration log)
 
-input_file2  <- "D:/Proiecte Rproj/Matrice CI/Denumiri.xlsx"       # existing naming/reporting template — READ ONLY, never modified
-output_file2 <- "D:/Proiecte Rproj/Matrice CI/Matricea CI_RAS.xlsx"   # new workbook: a full copy of the template with balanced results written in
+input_file2  <- "D:/Proiecte Rproj/Matrice CI/Denumiri.xlsx"        # existing naming/reporting template — READ ONLY, never modified
+output_file2 <- "D:/Proiecte Rproj/Matrice CI/Matricea CI_RAS.xlsx" # new workbook: a full copy of the template with balanced results written in
 sheet_name2  <- "nom"                                               # sheet in the input template to read from
 
 # Combines the base label, an underscore, and the 'an' object (e.g., "Matricea_CI_RAS_2022")
 sheet_name_output <- paste0("Matricea_CI_RAS_", an)
 
-max_iter <- 500      # hard cap on RAS iterations, in case of non-convergence
+max_iter <- 5000     # hard cap on RAS iterations, in case of non-convergence
 tol      <- 1e-6     # convergence tolerance: max allowed |actual total - target| on either margin
 epsilon  <- 1e-6     # placeholder value used ONLY for rows/cols that are all-zero but have a nonzero target
+
+# --- NEW options -------------------------------------------------------------
+reconcile_totals <- TRUE   # rescale column targets so sum(col_target) == sum(row_target)
+                           # (row targets, column CM, are treated as authoritative)
+auto_fix_support <- TRUE   # add small seed values where a row/column cannot reach its
+                           # target because of too many zero cells (see section 4b).
+                           # Set to FALSE to only REPORT the problem and decide yourself.
+support_weight   <- 1e-2   # size of the added seed values, as a share of the row/column
+                           # target (bigger = faster convergence, but a stronger
+                           # assumption about the new cells; they are rescaled by RAS anyway)
 
 ## ─────────────────────────────────────────────────────────────────────────
 ## 2. READ THE SEED MATRIX AND TARGETS
 ## ─────────────────────────────────────────────────────────────────────────
 # col_names = FALSE is essential here: with the default (TRUE), readxl
 # would treat the FIRST row of B6:CK93 (i.e. row 6 of the sheet) as a
-# header and silently drop it from the data — you'd end up balancing an
-# 87-row matrix without realizing a row went missing.
+# header and silently drop it from the data.
 seed <- read_excel(input_file, sheet = sheet_name,
                    range = "B6:CK93", col_names = FALSE)
 seed <- as.matrix(seed)
@@ -124,40 +130,94 @@ col_target <- read_excel(input_file, sheet = sheet_name,
 col_target <- as.numeric(col_target[1, ])
 col_target[is.na(col_target)] <- 0
 
-# matrix shape, rather than getting a cryptic recycling error mid-loop.
+# Check the targets match the matrix shape, rather than getting a cryptic
+# recycling error mid-loop.
 stopifnot(
   "row_target length must equal nrow(seed)"    = length(row_target) == n_rows,
   "col_target length must equal ncol(seed)"    = length(col_target) == n_cols
 )
 
+# Keep the original, untouched seed for reference / reporting
+seed_original <- seed
+
 ## ─────────────────────────────────────────────────────────────────────────
-## 3. FEASIBILITY CHECK
+## 3. FEASIBILITY CHECK (totals)
 ## ─────────────────────────────────────────────────────────────────────────
-# RAS preserves the grand total of the matrix at every step (scaling rows
-# then columns never changes the overall sum in a way that lets both
-# margins be hit exactly unless their totals agree). If they don't agree,
-# RAS still converges, but to the closest achievable compromise — one or
-# both margins will be off by roughly `total_diff` spread across cells.
+# RAS can only hit BOTH margins exactly if sum(row targets) == sum(col targets).
 total_diff <- sum(row_target) - sum(col_target)
 cat(sprintf("Sum of row targets:    %.4f\n", sum(row_target)))
 cat(sprintf("Sum of column targets: %.4f\n", sum(col_target)))
 cat(sprintf("Difference:            %.6f\n", total_diff))
+
 if (abs(total_diff) > 1e-6) {
-  warning("Row and column target totals do not match exactly (difference = ",
-          round(total_diff, 6), ") \u2014 RAS will converge to the best ",
-          "compromise, not to both margins exactly.")
+  if (reconcile_totals) {
+    scale_f <- sum(row_target) / sum(col_target)
+    col_target <- col_target * scale_f
+    cat(sprintf("reconcile_totals = TRUE: column targets rescaled by factor %.12f\n",
+                scale_f))
+    if (abs(scale_f - 1) > 1e-4) {
+      warning("Totals differed by more than 0.01% (factor = ", signif(scale_f, 6),
+              "). Check whether the row and column targets are really consistent.")
+    }
+  } else {
+    warning("Row and column target totals do not match exactly (difference = ",
+            round(total_diff, 6), ") \u2014 RAS will converge to the best ",
+            "compromise, not to both margins exactly.")
+  }
 }
 
 ## ─────────────────────────────────────────────────────────────────────────
-## 4. FIX STRUCTURAL ZEROS
+## 3b. SUPPORT CHECK (zero pattern)
+## ─────────────────────────────────────────────────────────────────────────
+# RAS only rescales cells that are already non-zero; it can never create
+# value in a zero cell. So a row can reach at most the sum of the column
+# targets of the columns where it has non-zero seed values (and vice versa).
+# If its target is higher than that, the row can never be balanced.
+# (Necessary condition, checked row-by-row and column-by-column.)
+check_support <- function(seed, row_target, col_target, tol = 1e-6) {
+  row_cap <- vapply(seq_len(nrow(seed)),
+                    function(i) sum(col_target[seed[i, ] != 0]), numeric(1))
+  col_cap <- vapply(seq_len(ncol(seed)),
+                    function(j) sum(row_target[seed[, j] != 0]), numeric(1))
+  list(bad_rows = which(row_target > row_cap + tol),
+       bad_cols = which(col_target > col_cap + tol),
+       row_cap  = row_cap,
+       col_cap  = col_cap)
+}
+
+report_support <- function(chk, row_target, col_target) {
+  if (length(chk$bad_rows) > 0) {
+    cat("UNREACHABLE ROW TARGETS (target > sum of column targets where the row has data):\n")
+    print(data.frame(matrix_row = chk$bad_rows,
+                     sheet_row  = chk$bad_rows + 5,   # data starts on sheet row 6
+                     target     = row_target[chk$bad_rows],
+                     reachable  = chk$row_cap[chk$bad_rows],
+                     shortfall  = row_target[chk$bad_rows] - chk$row_cap[chk$bad_rows]),
+          row.names = FALSE)
+  }
+  if (length(chk$bad_cols) > 0) {
+    cat("UNREACHABLE COLUMN TARGETS (target > sum of row targets where the column has data):\n")
+    print(data.frame(matrix_col = chk$bad_cols,
+                     target     = col_target[chk$bad_cols],
+                     reachable  = chk$col_cap[chk$bad_cols],
+                     shortfall  = col_target[chk$bad_cols] - chk$col_cap[chk$bad_cols]),
+          row.names = FALSE)
+  }
+}
+
+chk <- check_support(seed, row_target, col_target)
+if (length(chk$bad_rows) == 0 && length(chk$bad_cols) == 0) {
+  cat("Support check: OK (every row/column can reach its target).\n")
+} else {
+  report_support(chk, row_target, col_target)
+}
+
+## ─────────────────────────────────────────────────────────────────────────
+## 4. FIX STRUCTURAL ZEROS (entirely-zero rows/columns with a nonzero target)
 ## ─────────────────────────────────────────────────────────────────────────
 # A row/column that is all-zero in the seed but has a nonzero target is
-# mathematically unreachable by RAS (you can't scale your way up from
-# zero). This block finds any such rows/columns, reports them explicitly
-# (so you can sanity-check whether that's expected, e.g. a category with
-# genuinely no historical activity but a projected target), and gives
-# them a negligible epsilon value so the iteration can actually move
-# them toward their target instead of looping forever at zero.
+# mathematically unreachable by RAS. Give it a negligible epsilon value so
+# the iteration can move it toward its target.
 bad_rows <- which(rowSums(seed) == 0 & row_target != 0)
 bad_cols <- which(colSums(seed) == 0 & col_target != 0)
 
@@ -173,6 +233,60 @@ if (length(bad_cols) > 0) {
 }
 
 ## ─────────────────────────────────────────────────────────────────────────
+## 4b. FIX INSUFFICIENT SUPPORT (rows/cols that have data, but too few non-zero cells)
+## ─────────────────────────────────────────────────────────────────────────
+# For every row (or column) flagged by the support check, the zero cells
+# whose column (row) has a positive target receive a small seed value,
+# distributed in proportion to the opposing targets:
+#     added value = support_weight * own target * (opposing target / sum of opposing targets)
+# RAS then scales these cells as far as needed. This is a MODELLING
+# ASSUMPTION (these flows are allowed to be non-zero) — review the list of
+# cells printed below. Repeats up to 5 passes because fixing a row can
+# change the capacity of the columns.
+fixed_cells <- data.frame(matrix_row = integer(0), matrix_col = integer(0),
+                          sheet_row = integer(0), value = numeric(0))
+
+if (auto_fix_support) {
+  for (pass in 1:5) {
+    chk <- check_support(seed, row_target, col_target)
+    if (length(chk$bad_rows) == 0 && length(chk$bad_cols) == 0) break
+    
+    for (i in chk$bad_rows) {
+      zc <- which(seed[i, ] == 0 & col_target > 0)
+      if (length(zc) == 0) next
+      vals <- support_weight * row_target[i] * col_target[zc] / sum(col_target[zc])
+      seed[i, zc] <- vals
+      fixed_cells <- rbind(fixed_cells,
+                           data.frame(matrix_row = i, matrix_col = zc,
+                                      sheet_row = i + 5, value = vals))
+    }
+    for (j in chk$bad_cols) {
+      zr <- which(seed[, j] == 0 & row_target > 0)
+      if (length(zr) == 0) next
+      vals <- support_weight * col_target[j] * row_target[zr] / sum(row_target[zr])
+      seed[zr, j] <- vals
+      fixed_cells <- rbind(fixed_cells,
+                           data.frame(matrix_row = zr, matrix_col = j,
+                                      sheet_row = zr + 5, value = vals))
+    }
+  }
+  
+  if (nrow(fixed_cells) > 0) {
+    cat(sprintf("\nauto_fix_support: %d zero seed cells were given a small positive value.\n",
+                nrow(fixed_cells)))
+    cat("Rows affected (sheet row : number of cells added):\n")
+    print(table(fixed_cells$sheet_row))
+    cat("Review these assumptions \u2014 full list is saved in the 'Support_fix' sheet.\n\n")
+  }
+  
+  chk <- check_support(seed, row_target, col_target)
+  if (length(chk$bad_rows) > 0 || length(chk$bad_cols) > 0) {
+    warning("Support problems remain after auto-fix; some targets are still unreachable.")
+    report_support(chk, row_target, col_target)
+  }
+}
+
+## ─────────────────────────────────────────────────────────────────────────
 ## 5. RAS / IPF ITERATION FUNCTION
 ## ─────────────────────────────────────────────────────────────────────────
 #' Balance a matrix to match given row and column totals (RAS / IPF).
@@ -181,15 +295,11 @@ if (length(bad_cols) > 0) {
 #' @param col_target  numeric vector, length n_cols: desired column sums
 #' @param max_iter    maximum number of row+column passes before giving up
 #' @param tol         stop once BOTH max row error and max column error are below this
-#' @return list(matrix = balanced matrix, history = per-iteration error log,
-#'              iterations_run = number of iterations actually executed,
-#'              converged = TRUE/FALSE whether tol was reached)
+#' @return list(matrix, history, iterations_run, converged)
 ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6) {
   X <- seed
   
-  # Ratio helper that treats 0/0 as "leave it at 0" instead of NaN: a row
-  # or column whose current AND target totals are both zero should just
-  # stay zero, not blow up into an undefined multiplier.
+  # Ratio helper that treats 0/0 as "leave it at 0" instead of NaN.
   safe_ratio <- function(target, actual) {
     r <- numeric(length(target))
     nz <- actual != 0
@@ -203,11 +313,11 @@ ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6
                         max_col_err = numeric(0))
   converged <- FALSE
   for (k in seq_len(max_iter)) {
-    # --- row scaling: multiply every row by (its target / its current sum) ---
+    # --- row scaling ---
     rfac <- safe_ratio(row_target, rowSums(X))
     X <- X * rfac                      # recycles rfac down each row
     
-    # --- column scaling: multiply every column by (its target / its current sum) ---
+    # --- column scaling ---
     cfac <- safe_ratio(col_target, colSums(X))
     X <- sweep(X, 2, cfac, `*`)
     
@@ -218,8 +328,7 @@ ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6
                                          max_row_err = row_err,
                                          max_col_err = col_err))
     
-    # Print progress periodically so a long run isn't silent.
-    if (k %% 20 == 0) {
+    if (k %% 100 == 0) {
       cat(sprintf("  iter %4d: max row err = %.4e, max col err = %.4e\n",
                   k, row_err, col_err))
     }
@@ -236,7 +345,7 @@ ras_balance <- function(seed, row_target, col_target, max_iter = 500, tol = 1e-6
     warning(sprintf(
       "Did not reach tolerance %.1e within %d iterations (row err %.2e, col err %.2e). ",
       tol, max_iter, row_err, col_err),
-      "Consider raising max_iter, or re-checking target feasibility.")
+      "Check the support report above (unreachable targets) before raising max_iter.")
   }
   
   list(matrix = X, history = history,
@@ -252,12 +361,15 @@ balanced <- result$matrix
 
 # Summary Metadata Data Frame
 summary_metadata <- data.frame(
-  Metric = c("Year", "Total Iterations Executed", "Convergence Achieved", "Final Max Row Error", "Final Max Column Error"),
-  Value  = c(as.character(an), 
-             as.character(result$iterations_run), 
-             as.character(result$converged), 
-             sprintf("%.2e", tail(result$history$max_row_err, 1)), 
-             sprintf("%.2e", tail(result$history$max_col_err, 1)))
+  Metric = c("Year", "Total Iterations Executed", "Convergence Achieved",
+             "Final Max Row Error", "Final Max Column Error",
+             "Zero cells given seed values (auto_fix_support)"),
+  Value  = c(as.character(an),
+             as.character(result$iterations_run),
+             as.character(result$converged),
+             sprintf("%.2e", tail(result$history$max_row_err, 1)),
+             sprintf("%.2e", tail(result$history$max_col_err, 1)),
+             as.character(nrow(fixed_cells)))
 )
 
 ## ─────────────────────────────────────────────────────────────────────────
@@ -269,6 +381,14 @@ cat(sprintf("Max |column total - target|: %.8f\n", max(abs(colSums(balanced) - c
 cat(sprintf("Iterations run: %d\n", nrow(result$history)))
 cat(sprintf("Grand total (balanced vs. target): %.4f vs. %.4f\n",
             sum(balanced), sum(row_target)))
+
+# Name any row that still misses its target (should be none)
+row_gap <- rowSums(balanced) - row_target
+if (any(abs(row_gap) > 1e-3)) {
+  miss <- which(abs(row_gap) > 1e-3)
+  cat("Rows still off target (sheet row, gap):\n")
+  print(data.frame(sheet_row = miss + 5, gap = row_gap[miss]), row.names = FALSE)
+}
 
 ## ─────────────────────────────────────────────────────────────────────────
 ## 8. WRITE BALANCED MATRIX INTO A COPY OF THE Denumiri.xlsx TEMPLATE
@@ -286,7 +406,7 @@ nom_template <- readWorkbook(wb_den, sheet = sheet_name2, colNames = FALSE)
 row_codes    <- as.character(nom_template[2:nrow(nom_template), 1])
 col_codes    <- as.character(nom_template[1, 2:ncol(nom_template)])
 
-# 3. Rename the sheet in memory from "nom" to the dynamic sheet name (e.g., "Matricea_CI_RAS_2022")
+# 3. Rename the sheet in memory from "nom" to the dynamic sheet name
 renameWorksheet(wb_den, sheet = sheet_name2, newName = sheet_name_output)
 
 # 4. Decide whether template expects total rows/columns and format output dataframe
@@ -329,13 +449,41 @@ writeData(
   colNames = FALSE,
   rowNames = FALSE
 )
-# Add Metadata sheet to report iterations count
+
+# Metadata sheet (iterations, errors, number of auto-fixed cells)
 addWorksheet(wb_den, "Metadata_RAS")
 writeData(wb_den, sheet = "Metadata_RAS", x = summary_metadata)
+
+# Log of every zero seed cell that auto_fix_support filled (for review)
+if (nrow(fixed_cells) > 0) {
+  addWorksheet(wb_den, "Support_fix")
+  writeData(wb_den, sheet = "Support_fix", x = fixed_cells)
+}
 
 # 6. Save out to output_file2 (input_file2 remains untouched)
 saveWorkbook(wb_den, output_file2, overwrite = TRUE)
 
 cat(sprintf("\nBalanced matrix written into a new copy of the template: '%s' (sheet '%s').\n",
             output_file2, sheet_name_output))
+
+## ─────────────────────────────────────────────────────────────────────────
+## 9. STANDALONE RESULT WORKBOOK (balanced matrix + convergence log)
+## ─────────────────────────────────────────────────────────────────────────
+balanced_plain <- as.data.frame(balanced)
+colnames(balanced_plain) <- seq_len(n_cols)
+
+wb_out <- createWorkbook()
+addWorksheet(wb_out, sheet_name_output)
+writeData(wb_out, sheet_name_output, balanced_plain)
+addWorksheet(wb_out, "Convergence_log")
+writeData(wb_out, "Convergence_log", result$history)
+addWorksheet(wb_out, "Metadata_RAS")
+writeData(wb_out, "Metadata_RAS", summary_metadata)
+if (nrow(fixed_cells) > 0) {
+  addWorksheet(wb_out, "Support_fix")
+  writeData(wb_out, "Support_fix", fixed_cells)
+}
+saveWorkbook(wb_out, output_file, overwrite = TRUE)
+
+cat(sprintf("Standalone result workbook saved: '%s'\n", output_file))
 message("Gata!")
