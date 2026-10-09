@@ -136,7 +136,6 @@ stopifnot(
   "row_target length must equal nrow(seed)"    = length(row_target) == n_rows,
   "col_target length must equal ncol(seed)"    = length(col_target) == n_cols
 )
-
 # Keep the original, untouched seed for reference / reporting
 seed_original <- seed
 
@@ -245,7 +244,6 @@ if (length(bad_cols) > 0) {
 # change the capacity of the columns.
 fixed_cells <- data.frame(matrix_row = integer(0), matrix_col = integer(0),
                           sheet_row = integer(0), value = numeric(0))
-
 if (auto_fix_support) {
   for (pass in 1:5) {
     chk <- check_support(seed, row_target, col_target)
@@ -270,7 +268,7 @@ if (auto_fix_support) {
                                       sheet_row = zr + 5, value = vals))
     }
   }
-  
+
   if (nrow(fixed_cells) > 0) {
     cat(sprintf("\nauto_fix_support: %d zero seed cells were given a small positive value.\n",
                 nrow(fixed_cells)))
@@ -285,7 +283,6 @@ if (auto_fix_support) {
     report_support(chk, row_target, col_target)
   }
 }
-
 ## ─────────────────────────────────────────────────────────────────────────
 ## 5. RAS / IPF ITERATION FUNCTION
 ## ─────────────────────────────────────────────────────────────────────────
